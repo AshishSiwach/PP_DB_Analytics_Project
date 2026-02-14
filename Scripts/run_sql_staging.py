@@ -12,7 +12,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SQL_DIR = os.path.join(BASE_DIR, "sql")
 
 SQL_FILES = [
-    os.path.join(SQL_DIR, "01_staging.sql"),
+    os.path.join(SQL_DIR, "01_staging.sql")
 ]
 
 def split_sql_batches(sql_text: str):
