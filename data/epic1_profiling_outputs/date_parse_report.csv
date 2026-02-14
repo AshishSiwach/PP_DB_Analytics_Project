@@ -1,0 +1,6 @@
+table,column,nonnull_values,parsed_as_datetime,parse_success_pct
+accounts,opening_date,1634,1634,100
+customers,date_of_birth,1111,1079,97.12
+loans,estimated_end_date,327,327,100
+loans,start_date,327,327,100
+transactions,transaction_date,49000,49000,100

@@ -1,0 +1,12 @@
+key,exists,rows,nunique_including_null,nulls,duplicate_rows_on_key
+customer_id,TRUE,1111,1100,0,11
+customer_type_id,TRUE,3,3,0,0
+address_id,TRUE,1222,1210,0,12
+branch_id,TRUE,50,50,0,0
+account_id,TRUE,1667,1651,0,16
+account_type_id,TRUE,5,5,0,0
+account_status_id,TRUE,3,3,0,0
+loan_id,TRUE,333,330,0,3
+loan_status_id,TRUE,3,3,0,0
+transaction_id,TRUE,50000,49500,0,500
+transaction_type_id,TRUE,4,4,0,0
