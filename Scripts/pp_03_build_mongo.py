@@ -494,6 +494,11 @@ def main():
     cur = sql_conn.cursor()
 
     mongo_client, db = mongo_connect()
+    
+    print("Resetting MongoDB collections...")
+    db.customer_profiles.delete_many({})
+    db.risk_events.delete_many({})
+
 
     try:
         ensure_indexes(db)
