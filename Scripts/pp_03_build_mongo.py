@@ -2,6 +2,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import random
+import statistics
+import bisect
 
 import pyodbc
 from pymongo import MongoClient, UpdateOne
@@ -345,15 +347,24 @@ def derive_risk_events(txn_rows, txn_types):
     for cust_id, txns in by_customer.items():
         txns.sort(key=lambda x: x["TransactionDate"])
 
-        # Velocity: >= 8 txns in 1 hour
+        # Adaptive velocity: flag when activity in a 2-hour window is unusually high for this customer
+        # Baseline = median transactions per hour for this customer (data-driven, per-customer)
+        hourly_counts = defaultdict(int)
+        for t0 in txns:
+            hour_bucket = t0["TransactionDate"].replace(minute=0, second=0, microsecond=0)
+            hourly_counts[hour_bucket] += 1
+        baseline_per_hour = statistics.median(hourly_counts.values()) if hourly_counts else 0
+        # Expected in 2h ~= baseline_per_hour * 2; flag when > 3x expected, with a small floor to avoid noise
+        adaptive_threshold = max(4, int((baseline_per_hour * 2) * 3 + 0.9999))
+
         window = []
         for t in txns:
             ts = t["TransactionDate"]
             window.append((ts, t))
-            cutoff = ts - timedelta(hours=1)
+            cutoff = ts - timedelta(hours=2)
             while window and window[0][0] < cutoff:
                 window.pop(0)
-            if len(window) >= 8:
+            if len(window) >= adaptive_threshold:
                 events.append({
                     "_id": f"re_{t['TransactionID']}_VEL",
                     "event_id": f"re_{t['TransactionID']}_VEL",
@@ -363,23 +374,42 @@ def derive_risk_events(txn_rows, txn_types):
                     "loan_id": t.get("LoanID"),
                     "event_type": "TXN_VELOCITY_SPIKE",
                     "severity": "MEDIUM",
-                    "score_impact": 0.08,
+                    "score_impact": None,
                     "observed_at": ts.isoformat(),
                     "features": {
-                        "txn_count_last_1h": len(window),
+                        "txn_count_last_2h": len(window),
+                        "baseline_txn_per_hour_median": float(baseline_per_hour),
+                        "adaptive_threshold_last_2h": int(adaptive_threshold),
+                        "raw_velocity_ratio": float(len(window) / adaptive_threshold if adaptive_threshold else 0.0),
                         "amount": float(t["Amount"]) if t.get("Amount") is not None else None,
                         "transaction_type": txn_types.get(t["TransactionTypeID"])
                     },
-                    "rule": {"rule_id": "R_TXN_002", "description": "High transaction velocity within 1 hour"},
+                    "rule": {
+                        "rule_id": "R_TXN_002_ADAPT",
+                        "description": "Transaction velocity spike vs per-customer baseline (2h window)"
+                    },
                     "as_of": as_of_iso,
                     "source": {"derived_from": "dbo.transactions", "pipeline_version": PIPELINE_VERSION}
                 })
+# High value: per-customer 95th percentile (fallback to global P95 if a customer has too few transactions)
+        cust_amounts = [float(t0["Amount"]) for t0 in txns if t0.get("Amount") is not None]
+        cust_amounts_sorted = sorted(cust_amounts)
+        cust_p95 = None
+        cust_p95_scope = None
 
-        # High value: >= P95
-        if p95 is not None:
+        MIN_TXNS_FOR_CUST_P95 = 20  # keep this small; synthetic data can be sparse per customer
+        if len(cust_amounts_sorted) >= MIN_TXNS_FOR_CUST_P95:
+            idx_c = int(round(0.95 * (len(cust_amounts_sorted) - 1)))
+            cust_p95 = cust_amounts_sorted[idx_c]
+            cust_p95_scope = "customer"
+        elif p95 is not None:
+            cust_p95 = p95
+            cust_p95_scope = "global_fallback"
+
+        if cust_p95 is not None:
             for t in txns:
                 amt = float(t["Amount"]) if t.get("Amount") is not None else None
-                if amt is not None and amt >= p95:
+                if amt is not None and amt >= cust_p95:
                     ts = t["TransactionDate"]
                     events.append({
                         "_id": f"re_{t['TransactionID']}_HV",
@@ -394,13 +424,78 @@ def derive_risk_events(txn_rows, txn_types):
                         "observed_at": ts.isoformat(),
                         "features": {
                             "amount": amt,
-                            "threshold_p95": p95,
+                            "threshold_p95": float(cust_p95),
+                            "threshold_scope": cust_p95_scope,
+                            "raw_amount_ratio": float(amt / cust_p95) if cust_p95 else None,
+                            "customer_txn_amount_n": int(len(cust_amounts_sorted)),
                             "transaction_type": txn_types.get(t["TransactionTypeID"])
                         },
-                        "rule": {"rule_id": "R_TXN_001", "description": "Transaction amount above 95th percentile"},
+                        "rule": {"rule_id": "R_TXN_001_ADAPT", "description": "Transaction amount above 95th percentile (per-customer, with fallback)"},
                         "as_of": as_of_iso,
                         "source": {"derived_from": "dbo.transactions", "pipeline_version": PIPELINE_VERSION}
                     })
+
+    # ------------------------------------------------------------
+    # Data-calibrated scoring (unsupervised)
+    # ------------------------------------------------------------
+    # We do not have ground-truth labels (fraud/default) in this prototype.
+    # Instead of hard-coding fixed impacts (e.g., 0.08/0.12), we calibrate
+    # impacts using the empirical distribution of "how extreme" each event is.
+    #
+    # - TXN_VELOCITY_SPIKE: raw = txn_count_last_2h / adaptive_threshold_last_2h  (>=1 means threshold crossed)
+    # - HIGH_VALUE_TXN:     raw = amount / threshold_p95  (>=1 means threshold crossed)
+    #
+    # We map raw extremeness to a bounded score_impact via an empirical CDF per event_type.
+    # More extreme events get higher impact, preserving rank ordering for analytics.
+    def _ecdf_score(sorted_vals, x):
+        if not sorted_vals:
+            return 0.0
+        # proportion of values <= x
+        return bisect.bisect_right(sorted_vals, x) / float(len(sorted_vals))
+
+    # collect raw values per event_type
+    raw_by_type = defaultdict(list)
+    for e in events:
+        et = e.get("event_type")
+        feats = e.get("features", {}) or {}
+        raw = None
+        if et == "TXN_VELOCITY_SPIKE":
+            raw = feats.get("raw_velocity_ratio")
+        elif et == "HIGH_VALUE_TXN":
+            raw = feats.get("raw_amount_ratio")
+        if raw is not None:
+            raw_by_type[et].append(float(raw))
+
+    sorted_raw = {k: sorted(v) for k, v in raw_by_type.items()}
+
+    # Map to bounded ranges by severity band (tunable but now *data-calibrated* within band)
+    # MEDIUM: 0.04–0.10   HIGH: 0.08–0.20
+    BAND = {
+        "MEDIUM": (0.04, 0.10),
+        "HIGH": (0.08, 0.20),
+    }
+
+    for e in events:
+        et = e.get("event_type")
+        sev = e.get("severity")
+        lo, hi = BAND.get(sev, (0.05, 0.15))
+        feats = e.get("features", {}) or {}
+        if et == "TXN_VELOCITY_SPIKE":
+            raw = feats.get("raw_velocity_ratio")
+        elif et == "HIGH_VALUE_TXN":
+            raw = feats.get("raw_amount_ratio")
+        else:
+            raw = None
+
+        if raw is None or et not in sorted_raw:
+            # fallback to mid-band if we cannot compute raw
+            e["score_impact"] = round((lo + hi) / 2.0, 6)
+            continue
+
+        q = _ecdf_score(sorted_raw[et], float(raw))  # 0..1
+        e["score_impact"] = round(lo + (hi - lo) * q, 6)
+
+
 
     filtered = []
     for e in events:
