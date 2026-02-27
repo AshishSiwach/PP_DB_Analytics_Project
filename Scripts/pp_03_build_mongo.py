@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+import random
 
 import pyodbc
 from pymongo import MongoClient, UpdateOne
@@ -23,9 +24,13 @@ MONGO_DB = os.getenv("MONGO_DB", "finance_pp")
 
 PIPELINE_VERSION = "pp_v1"
 
-RECENT_ACTIVITY_CAP = 100  # RULE 1
-RISK_SCORE_IMPACT_THRESHOLD = 0.05  # RULE 2
-SEVERITIES_TO_KEEP = {"MEDIUM", "HIGH"}  # RULE 2
+RECENT_ACTIVITY_CAP = 100
+RISK_SCORE_IMPACT_THRESHOLD = 0.05
+SEVERITIES_TO_KEEP = {"MEDIUM", "HIGH"}
+
+# Used to make dates realistic when source dates are NULL/1900
+SYNTHETIC_DATE_WINDOW_DAYS = int(os.getenv("SYNTHETIC_DATE_WINDOW_DAYS", "120"))
+MIN_REALISTIC_DATE = datetime(2000, 1, 1)  # anything older treated as placeholder
 
 
 # -----------------------------
@@ -43,20 +48,6 @@ def sql_connect():
 
 
 def fetchall_dict(cursor, query: str, params=None):
-    """_summary_
-
-    Args:
-        cursor (_type_): _description_
-        query (str): _description_
-        params (_type_, optional): _description_. Defaults to None.
-
-    Returns:
-        _type_: _description_
-    
-    This is a utility that takes a cursor, a SQL query, and optional parameters.
-    It runs the query, grabs the column names from the cursor description, fetches all the rows,
-    and then converts each row into a dictionary where the keys are column names and the values are the row values.
-    """
     cursor.execute(query, params or [])
     cols = [c[0] for c in cursor.description]
     rows = cursor.fetchall()
@@ -64,6 +55,29 @@ def fetchall_dict(cursor, query: str, params=None):
     for r in rows:
         out.append({cols[i]: r[i] for i in range(len(cols))})
     return out
+
+
+def normalize_dt(dt):
+    """
+    Ensures a usable datetime in UTC.
+    If dt is None or clearly placeholder (e.g. 1900), generate a synthetic recent timestamp.
+    """
+    now = datetime.now(timezone.utc)
+
+    if dt is None:
+        delta_minutes = random.randint(0, SYNTHETIC_DATE_WINDOW_DAYS * 24 * 60)
+        return now - timedelta(minutes=delta_minutes)
+
+    # pyodbc gives naive datetime, treat as UTC for project purposes
+    if isinstance(dt, datetime):
+        if dt < MIN_REALISTIC_DATE:
+            delta_minutes = random.randint(0, SYNTHETIC_DATE_WINDOW_DAYS * 24 * 60)
+            return now - timedelta(minutes=delta_minutes)
+        return dt.replace(tzinfo=timezone.utc)
+
+    # fallback
+    delta_minutes = random.randint(0, SYNTHETIC_DATE_WINDOW_DAYS * 24 * 60)
+    return now - timedelta(minutes=delta_minutes)
 
 
 # -----------------------------
@@ -76,12 +90,10 @@ def mongo_connect():
 
 
 def ensure_indexes(db):
-    # customer_profiles
     db.customer_profiles.create_index("customer_id", unique=True)
     db.customer_profiles.create_index("accounts.account_id")
     db.customer_profiles.create_index([("risk_profile.risk_band", 1), ("risk_profile.risk_score", -1)])
 
-    # risk_events
     db.risk_events.create_index([("customer_id", 1), ("observed_at", -1)])
     db.risk_events.create_index([("severity", 1), ("observed_at", -1)])
     db.risk_events.create_index([("event_type", 1), ("observed_at", -1)])
@@ -94,16 +106,6 @@ def ensure_indexes(db):
 # Transform: build customer_profiles
 # -----------------------------
 def build_customer_profiles(cur):
-    """
-    Builds:
-      - one doc per customer
-      - embedded accounts[]
-      - loans_summary (incl. small embedded loans list)
-      - recent_activity[] capped at RECENT_ACTIVITY_CAP
-      - derived risk_profile (simple signals from transactions/loans)
-    """
-
-    # --- Lookups ---
     customer_types = {
         r["CustomerTypeID"]: r["TypeName"]
         for r in fetchall_dict(cur, "SELECT CustomerTypeID, TypeName FROM dbo.customer_types;")
@@ -125,17 +127,14 @@ def build_customer_profiles(cur):
         for r in fetchall_dict(cur, "SELECT TransactionTypeID, TypeName FROM dbo.transaction_types;")
     }
 
-    # --- Addresses ---
     addr_rows = fetchall_dict(cur, "SELECT AddressID, Street, City, Country FROM dbo.addresses;")
     addresses = {r["AddressID"]: r for r in addr_rows}
 
-    # --- Customers ---
     customers = fetchall_dict(cur, """
         SELECT CustomerID, FirstName, LastName, DateOfBirth, AddressID, CustomerTypeID
         FROM dbo.customers;
     """)
 
-    # --- Accounts ---
     accounts_rows = fetchall_dict(cur, """
         SELECT AccountID, CustomerID, AccountTypeID, AccountStatusID, Balance, OpeningDate
         FROM dbo.accounts;
@@ -144,27 +143,21 @@ def build_customer_profiles(cur):
     for a in accounts_rows:
         accounts_by_customer[a["CustomerID"]].append(a)
 
-    # --- Loans (two roles, but we attach by customer via repayment/disbursement accounts) ---
     loans_rows = fetchall_dict(cur, """
         SELECT LoanID, DisbursementAccountID, RepaymentAccountID, LoanStatusID,
                PrincipalAmount, InterestRate, StartDate, EstimatedEndDate
         FROM dbo.loans;
     """)
 
-    # Map account -> customer (for loan attribution)
     account_to_customer = {a["AccountID"]: a["CustomerID"] for a in accounts_rows}
 
     loans_by_customer = defaultdict(list)
     for l in loans_rows:
-        # Prefer repayment account -> customer mapping; fall back to disbursement account
         cust_id = account_to_customer.get(l["RepaymentAccountID"]) or account_to_customer.get(l["DisbursementAccountID"])
         if cust_id is not None:
             loans_by_customer[cust_id].append(l)
 
-    # --- Recent Activity: fetch last N transactions per customer ---
-    # We do this efficiently:
-    # 1) fetch transactions joined to accounts to know customer_id via origin account (core requirement)
-    # 2) sort per customer by TransactionDate DESC, keep top N
+    # Use LEFT JOINs so we DON'T drop transactions if an account lookup fails.
     txn_rows = fetchall_dict(cur, """
         SELECT
             t.TransactionID,
@@ -176,23 +169,29 @@ def build_customer_profiles(cur):
             t.TransactionDate,
             t.BranchID,
             t.Description,
-            a.CustomerID AS CustomerID
+            COALESCE(a1.CustomerID, a2.CustomerID) AS CustomerID
         FROM dbo.transactions t
-        JOIN dbo.accounts a ON t.AccountOriginID = a.AccountID;
+        LEFT JOIN dbo.accounts a1 ON t.AccountOriginID = a1.AccountID
+        LEFT JOIN dbo.accounts a2 ON t.AccountDestinationID = a2.AccountID;
     """)
+
+    # Drop transactions where we STILL cannot derive a customer
+    txn_rows = [t for t in txn_rows if t.get("CustomerID") is not None]
+
+    # Normalize transaction dates for downstream 30-day logic
+    for t in txn_rows:
+        t["TransactionDate"] = normalize_dt(t.get("TransactionDate"))
 
     txns_by_customer = defaultdict(list)
     for t in txn_rows:
         txns_by_customer[t["CustomerID"]].append(t)
 
-    # Build final docs
     as_of_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     docs = []
     for c in customers:
         cust_id = c["CustomerID"]
 
-        # profile
         profile = {
             "first_name": c.get("FirstName"),
             "last_name": c.get("LastName"),
@@ -203,7 +202,6 @@ def build_customer_profiles(cur):
             }
         }
 
-        # address (optional)
         addr = addresses.get(c.get("AddressID"))
         address_doc = None
         if addr:
@@ -214,7 +212,6 @@ def build_customer_profiles(cur):
                 "country": addr.get("Country")
             }
 
-        # accounts embedded
         acc_docs = []
         for a in accounts_by_customer.get(cust_id, []):
             acc_docs.append({
@@ -225,7 +222,6 @@ def build_customer_profiles(cur):
                 "opening_date": a["OpeningDate"].isoformat() if a.get("OpeningDate") else None
             })
 
-        # loans summary embedded (small)
         cust_loans = loans_by_customer.get(cust_id, [])
         loan_docs = []
         active_count = 0
@@ -264,48 +260,31 @@ def build_customer_profiles(cur):
             "loans": loan_docs
         }
 
-        # recent activity (bounded)
         cust_txns = txns_by_customer.get(cust_id, [])
-        cust_txns.sort(key=lambda x: (x["TransactionDate"] or datetime(1900, 1, 1)), reverse=True)
-        cust_txns = cust_txns[:RECENT_ACTIVITY_CAP]  # RULE 1
+        cust_txns.sort(key=lambda x: x["TransactionDate"], reverse=True)
+        cust_txns = cust_txns[:RECENT_ACTIVITY_CAP]
 
         recent_activity = []
         for t in cust_txns:
             recent_activity.append({
                 "transaction_id": t["TransactionID"],
-                "ts": t["TransactionDate"].replace(tzinfo=timezone.utc).isoformat() if t.get("TransactionDate") else None,
+                "ts": t["TransactionDate"].isoformat(),
                 "type": {"id": t["TransactionTypeID"], "name": txn_types.get(t["TransactionTypeID"])},
                 "amount": float(t["Amount"]) if t.get("Amount") is not None else None,
-                "origin_account_id": t["AccountOriginID"],
+                "origin_account_id": t.get("AccountOriginID"),
                 "destination_account_id": t.get("AccountDestinationID"),
                 "branch_id": t.get("BranchID"),
                 "loan_id": t.get("LoanID"),
                 "description": t.get("Description")
             })
 
-        # simple derived risk_profile (lightweight, explainable)
-        # signals:
-        # - txn_velocity_24h: count of txns last 24 hours (within available timestamps)
-        # - high_value_txn_30d: count of txns >= P95 threshold in last 30 days (computed globally in risk step; here approximate)
-        # - loan_active: bool from loans
         now = datetime.now(timezone.utc)
         last_24h = now - timedelta(hours=24)
-        last_30d = now - timedelta(days=30)
 
-        txn_24h = 0
-        txn_30d_amounts = []
-        for t in txns_by_customer.get(cust_id, []):
-            dt = t.get("TransactionDate")
-            if dt:
-                dt_utc = dt.replace(tzinfo=timezone.utc)
-                if dt_utc >= last_24h:
-                    txn_24h += 1
-                if dt_utc >= last_30d and t.get("Amount") is not None:
-                    txn_30d_amounts.append(float(t["Amount"]))
+        txn_24h = sum(1 for t in txns_by_customer.get(cust_id, []) if t["TransactionDate"] >= last_24h)
 
-        # crude risk score (0..1): higher velocity and active loan increase risk a bit
         base = 0.20
-        velocity_component = min(txn_24h / 50.0, 0.50)  # cap
+        velocity_component = min(txn_24h / 50.0, 0.50)
         loan_component = 0.10 if active_count > 0 else 0.0
         risk_score = max(0.0, min(1.0, base + velocity_component + loan_component))
 
@@ -349,12 +328,6 @@ def build_customer_profiles(cur):
 # Transform: derive risk_events (flagged only)
 # -----------------------------
 def derive_risk_events(txn_rows, txn_types):
-    """
-    Creates risk_events from SQL transactions using simple, explainable rules.
-    Stores ONLY flagged/high-signal events (RULE 2).
-    """
-
-    # Compute global P95 threshold for "high value" transactions (only numeric amounts)
     amounts = [float(t["Amount"]) for t in txn_rows if t.get("Amount") is not None]
     amounts_sorted = sorted(amounts)
     p95 = None
@@ -362,7 +335,6 @@ def derive_risk_events(txn_rows, txn_types):
         idx = int(round(0.95 * (len(amounts_sorted) - 1)))
         p95 = amounts_sorted[idx]
 
-    # Group txns per customer for velocity rules
     by_customer = defaultdict(list)
     for t in txn_rows:
         by_customer[t["CustomerID"]].append(t)
@@ -371,31 +343,27 @@ def derive_risk_events(txn_rows, txn_types):
     as_of_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     for cust_id, txns in by_customer.items():
-        # Sort by time asc for windowing
-        txns = [t for t in txns if t.get("TransactionDate") is not None]
         txns.sort(key=lambda x: x["TransactionDate"])
 
-        # Sliding window velocity: count within last 1 hour
-        # Flag if >= 8 txns in 1 hour (tuneable)
+        # Velocity: >= 8 txns in 1 hour
         window = []
         for t in txns:
-            ts = t["TransactionDate"].replace(tzinfo=timezone.utc)
+            ts = t["TransactionDate"]
             window.append((ts, t))
             cutoff = ts - timedelta(hours=1)
             while window and window[0][0] < cutoff:
                 window.pop(0)
             if len(window) >= 8:
-                # Create event on current transaction (avoid spamming: only emit when hitting threshold)
-                event = {
+                events.append({
                     "_id": f"re_{t['TransactionID']}_VEL",
                     "event_id": f"re_{t['TransactionID']}_VEL",
                     "customer_id": cust_id,
-                    "account_id": t["AccountOriginID"],
+                    "account_id": t.get("AccountOriginID"),
                     "transaction_id": t["TransactionID"],
                     "loan_id": t.get("LoanID"),
                     "event_type": "TXN_VELOCITY_SPIKE",
                     "severity": "MEDIUM",
-                    "score_impact": 0.08,  # >= 0.05 => kept
+                    "score_impact": 0.08,
                     "observed_at": ts.isoformat(),
                     "features": {
                         "txn_count_last_1h": len(window),
@@ -405,25 +373,24 @@ def derive_risk_events(txn_rows, txn_types):
                     "rule": {"rule_id": "R_TXN_002", "description": "High transaction velocity within 1 hour"},
                     "as_of": as_of_iso,
                     "source": {"derived_from": "dbo.transactions", "pipeline_version": PIPELINE_VERSION}
-                }
-                events.append(event)
+                })
 
-        # High-value transactions (>= P95): severity HIGH
+        # High value: >= P95
         if p95 is not None:
             for t in txns:
                 amt = float(t["Amount"]) if t.get("Amount") is not None else None
                 if amt is not None and amt >= p95:
-                    ts = t["TransactionDate"].replace(tzinfo=timezone.utc)
-                    event = {
+                    ts = t["TransactionDate"]
+                    events.append({
                         "_id": f"re_{t['TransactionID']}_HV",
                         "event_id": f"re_{t['TransactionID']}_HV",
                         "customer_id": cust_id,
-                        "account_id": t["AccountOriginID"],
+                        "account_id": t.get("AccountOriginID"),
                         "transaction_id": t["TransactionID"],
                         "loan_id": t.get("LoanID"),
                         "event_type": "HIGH_VALUE_TXN",
                         "severity": "HIGH",
-                        "score_impact": 0.12,  # >= 0.05 => kept
+                        "score_impact": 0.12,
                         "observed_at": ts.isoformat(),
                         "features": {
                             "amount": amt,
@@ -433,10 +400,8 @@ def derive_risk_events(txn_rows, txn_types):
                         "rule": {"rule_id": "R_TXN_001", "description": "Transaction amount above 95th percentile"},
                         "as_of": as_of_iso,
                         "source": {"derived_from": "dbo.transactions", "pipeline_version": PIPELINE_VERSION}
-                    }
-                    events.append(event)
+                    })
 
-    # RULE 2 filter (redundant here because our rules already meet threshold, but keep explicit)
     filtered = []
     for e in events:
         if (e["severity"] in SEVERITIES_TO_KEEP) or (e.get("score_impact", 0) >= RISK_SCORE_IMPACT_THRESHOLD):
@@ -449,35 +414,22 @@ def derive_risk_events(txn_rows, txn_types):
 # Load to Mongo
 # -----------------------------
 def upsert_customer_profiles(db, docs):
-    ops = []
-    for d in docs:
-        ops.append(
-            UpdateOne(
-                {"customer_id": d["customer_id"]},
-                {"$set": d},
-                upsert=True
-            )
-        )
-
+    ops = [
+        UpdateOne({"customer_id": d["customer_id"]}, {"$set": d}, upsert=True)
+        for d in docs
+    ]
     if not ops:
         print("No customer profile docs to upsert.")
         return
-
     res = db.customer_profiles.bulk_write(ops, ordered=False)
     print(f"✅ customer_profiles upserted. matched={res.matched_count}, upserted={len(res.upserted_ids) if res.upserted_ids else 0}")
 
 
 def insert_risk_events(db, events):
     if not events:
-        print("No risk events generated (nothing flagged).")
+        print("❌ No risk events generated (nothing flagged).")
         return
-
-    # Use upsert-like behavior by using _id uniqueness; insert_many with ordered=False will ignore duplicates if handled
-    # Safer: bulk upsert on _id
-    ops = []
-    for e in events:
-        ops.append(UpdateOne({"_id": e["_id"]}, {"$setOnInsert": e}, upsert=True))
-
+    ops = [UpdateOne({"_id": e["_id"]}, {"$setOnInsert": e}, upsert=True) for e in events]
     try:
         res = db.risk_events.bulk_write(ops, ordered=False)
         print(f"✅ risk_events written. upserted={len(res.upserted_ids) if res.upserted_ids else 0}, matched={res.matched_count}")
@@ -489,29 +441,26 @@ def insert_risk_events(db, events):
 # Main
 # -----------------------------
 def main():
-    # Connect
     sql_conn = sql_connect()
     cur = sql_conn.cursor()
-
     mongo_client, db = mongo_connect()
-    
+
     print("Resetting MongoDB collections...")
     db.customer_profiles.delete_many({})
     db.risk_events.delete_many({})
 
-
     try:
         ensure_indexes(db)
 
-        # Build docs
         profiles, txn_rows, txn_types = build_customer_profiles(cur)
-        events = derive_risk_events(txn_rows, txn_types)
+        print(f"DEBUG: extracted txn_rows={len(txn_rows)}")
 
-        # Load
+        events = derive_risk_events(txn_rows, txn_types)
+        print(f"DEBUG: derived risk_events={len(events)}")
+
         upsert_customer_profiles(db, profiles)
         insert_risk_events(db, events)
 
-        # Quick counts
         print(f"Mongo counts: customer_profiles={db.customer_profiles.count_documents({})}, risk_events={db.risk_events.count_documents({})}")
 
     finally:
