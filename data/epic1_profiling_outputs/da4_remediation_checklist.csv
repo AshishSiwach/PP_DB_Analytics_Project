@@ -1,6 +1,0 @@
-issue_type,table,key,action,severity
-duplicate_pk,customers,customer_id,"Deduplicate in staging using ROW_NUMBER() over PK; keep first, log others.",high
-duplicate_pk,addresses,address_id,"Deduplicate in staging using ROW_NUMBER() over PK; keep first, log others.",high
-duplicate_pk,accounts,account_id,"Deduplicate in staging using ROW_NUMBER() over PK; keep first, log others.",high
-duplicate_pk,loans,loan_id,"Deduplicate in staging using ROW_NUMBER() over PK; keep first, log others.",high
-duplicate_pk,transactions,transaction_id,"Deduplicate in staging using ROW_NUMBER() over PK; keep first, log others.",high

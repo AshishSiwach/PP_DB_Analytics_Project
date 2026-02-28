@@ -1,5 +1,0 @@
-table,column,nonnull_values,coerced_numeric,coerce_success_pct,min,max
-accounts,balance,1667,1667,100,-486.68,99828.98
-loans,interest_rate,333,333,100,0.0301,0.15
-loans,principal_amount,333,333,100,1128.49,99830.33
-transactions,amount,50000,50000,100,1.01,4999.59
