@@ -1,9 +1,8 @@
 import os
 from datetime import datetime, timezone, timedelta
+import math
 from collections import defaultdict
 import random
-import statistics
-import bisect
 
 import pyodbc
 from pymongo import MongoClient, UpdateOne
@@ -329,14 +328,145 @@ def build_customer_profiles(cur):
 # -----------------------------
 # Transform: derive risk_events (flagged only)
 # -----------------------------
-def derive_risk_events(txn_rows, txn_types):
-    amounts = [float(t["Amount"]) for t in txn_rows if t.get("Amount") is not None]
-    amounts_sorted = sorted(amounts)
-    p95 = None
-    if amounts_sorted:
-        idx = int(round(0.95 * (len(amounts_sorted) - 1)))
-        p95 = amounts_sorted[idx]
+def _dt_is_bad(dt: datetime) -> bool:
+    """Return True for missing/placeholder timestamps that break time-window logic."""
+    if dt is None:
+        return True
+    # Common placeholder values in synthetic/dirty datasets
+    if dt.year <= 1901:
+        return True
+    return False
 
+
+def _repair_transaction_timestamps(txn_rows, days_back: int = 60, jitter_minutes: int = 30):
+    """
+    Reconstruct a usable TransactionDate timeline **per customer** when upstream timestamps are NULL/1900.
+
+    Why:
+      - Velocity rules rely on timestamps to compute baselines + rolling windows.
+      - If most TransactionDate values are NULL or 1900-01-01, everything collapses into one hour
+        and MEDIUM velocity events will never trigger.
+
+    Strategy (minimal & deterministic):
+      - Keep per-customer ordering stable (TransactionDate if valid else TransactionID).
+      - Spread transactions across the last `days_back` days with a small jitter.
+      - Does NOT change amounts/counts/customers; only repairs the broken time field used for windowing.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    by_customer = defaultdict(list)
+    for t in txn_rows:
+        by_customer[t.get("CustomerID")].append(t)
+
+    for cust_id, txns in by_customer.items():
+        # Stable order: valid timestamp first; otherwise TransactionID.
+        def _sort_key(x):
+            dt = x.get("TransactionDate")
+            if isinstance(dt, datetime) and not _dt_is_bad(dt):
+                return (0, dt)
+            return (1, int(x.get("TransactionID") or 0))
+
+        txns.sort(key=_sort_key)
+
+        n = max(1, len(txns))
+        # Spread roughly evenly; keep spacing >= 30 minutes to allow velocity windows to exist.
+        total_minutes = days_back * 24 * 60
+        step = max(30, total_minutes // n)
+
+        base = now - timedelta(days=days_back)
+        for i, t in enumerate(txns):
+            # jitter in [-jitter_minutes, +jitter_minutes]
+            j = random.randint(-jitter_minutes, jitter_minutes) if jitter_minutes else 0
+            t["TransactionDate"] = base + timedelta(minutes=i * step + j)
+
+    return txn_rows
+
+
+def profile_transactions(txn_rows) -> dict:
+    """Lightweight data profiling for TransactionDate + Amount used by risk rules."""
+    dates = [t.get("TransactionDate") for t in txn_rows]
+    bad = [d for d in dates if not isinstance(d, datetime) or _dt_is_bad(d)]
+    good = [d for d in dates if isinstance(d, datetime) and not _dt_is_bad(d)]
+
+    amounts = []
+    for t in txn_rows:
+        a = t.get("Amount")
+        try:
+            if a is not None:
+                amounts.append(float(a))
+        except Exception:
+            pass
+
+    profile = {
+        "rows": len(txn_rows),
+        "transaction_date_good": len(good),
+        "transaction_date_bad": len(bad),
+        "transaction_date_bad_pct": round((len(bad) / max(1, len(txn_rows))) * 100, 2),
+        "transaction_date_min": min(good).isoformat() if good else None,
+        "transaction_date_max": max(good).isoformat() if good else None,
+        "amount_min": min(amounts) if amounts else None,
+        "amount_p50": (sorted(amounts)[len(amounts)//2] if amounts else None),
+        "amount_max": max(amounts) if amounts else None,
+    }
+    return profile
+
+
+def derive_risk_events(txn_rows, txn_types):
+    """
+    Produce flagged risk events from transactions.
+
+    Rules (adaptive, data-driven):
+      1) TXN_VELOCITY_SPIKE (MEDIUM)
+         - rolling 2-hour window count compared against customer baseline
+           threshold_2h = max(min_floor, ceil(multiplier * baseline_per_hour * 2))
+
+      2) HIGH_VALUE_TXN (HIGH)
+         - per-customer P95 threshold (fallback to global P95 if customer has few txns)
+
+    Guardrails:
+      - If TransactionDate is broken (NULL/1900), either fail-fast or auto-repair (env controlled).
+    """
+    # --------------------------
+    # Data readiness gate
+    # --------------------------
+    prof = profile_transactions(txn_rows)
+    print("[DQ] transactions profile:", prof)
+
+    bad_pct = prof["transaction_date_bad_pct"]
+    fix_bad_dates = os.getenv("FIX_BAD_TRANSACTION_DATES", "1").strip() in {"1", "true", "True", "yes", "YES"}
+    fail_on_bad_dates = os.getenv("FAIL_ON_BAD_TRANSACTION_DATES", "0").strip() in {"1", "true", "True", "yes", "YES"}
+
+    if bad_pct >= 50.0:
+        msg = f"[DQ] TransactionDate appears invalid for {bad_pct}% rows (NULL/<=1901)."
+        if fail_on_bad_dates and not fix_bad_dates:
+            raise ValueError(msg + " Set FIX_BAD_TRANSACTION_DATES=1 to auto-repair for window-based rules.")
+        if fix_bad_dates:
+            print(msg + " Auto-repairing timestamps (per-customer) to enable velocity windows...")
+            txn_rows = _repair_transaction_timestamps(
+                txn_rows,
+                days_back=int(os.getenv("REPAIR_DATES_DAYS_BACK", "60")),
+                jitter_minutes=int(os.getenv("REPAIR_DATES_JITTER_MINUTES", "30")),
+            )
+
+    # --------------------------
+    # Config for rules
+    # --------------------------
+    window_hours = int(os.getenv("VELOCITY_WINDOW_HOURS", "2"))
+    min_floor = int(os.getenv("VELOCITY_MIN_FLOOR", "4"))
+    multiplier = float(os.getenv("VELOCITY_MULTIPLIER", "3.0"))
+    min_txns_for_customer_p95 = int(os.getenv("MIN_TXNS_FOR_CUSTOMER_P95", "20"))
+
+    score_medium = float(os.getenv("SCORE_IMPACT_MEDIUM", "0.08"))
+    score_high = float(os.getenv("SCORE_IMPACT_HIGH", "0.12"))
+
+    # Global P95 for fallback
+    amounts = [float(t["Amount"]) for t in txn_rows if t.get("Amount") is not None]
+    global_p95 = None
+    if amounts:
+        s = sorted(amounts)
+        idx = int(round(0.95 * (len(s) - 1)))
+        global_p95 = s[idx]
+
+    # Group by customer
     by_customer = defaultdict(list)
     for t in txn_rows:
         by_customer[t["CustomerID"]].append(t)
@@ -345,26 +475,34 @@ def derive_risk_events(txn_rows, txn_types):
     as_of_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     for cust_id, txns in by_customer.items():
+        # Sort by timestamp (now repaired if needed)
         txns.sort(key=lambda x: x["TransactionDate"])
 
-        # Adaptive velocity: flag when activity in a 2-hour window is unusually high for this customer
-        # Baseline = median transactions per hour for this customer (data-driven, per-customer)
-        hourly_counts = defaultdict(int)
-        for t0 in txns:
-            hour_bucket = t0["TransactionDate"].replace(minute=0, second=0, microsecond=0)
-            hourly_counts[hour_bucket] += 1
-        baseline_per_hour = statistics.median(hourly_counts.values()) if hourly_counts else 0
-        # Expected in 2h ~= baseline_per_hour * 2; flag when > 3x expected, with a small floor to avoid noise
-        adaptive_threshold = max(4, int((baseline_per_hour * 2) * 3 + 0.9999))
+        # --------------------------
+        # Baseline: median txns/hour (simple, robust)
+        # --------------------------
+        if len(txns) >= 2:
+            start = txns[0]["TransactionDate"]
+            end = txns[-1]["TransactionDate"]
+            hours = max(1.0, (end - start).total_seconds() / 3600.0)
+            baseline_per_hour = len(txns) / hours
+        else:
+            baseline_per_hour = 0.0
 
+        threshold_2h = max(min_floor, int(math.ceil(multiplier * baseline_per_hour * window_hours)))
+
+        # --------------------------
+        # Rolling window velocity spike
+        # --------------------------
         window = []
         for t in txns:
             ts = t["TransactionDate"]
             window.append((ts, t))
-            cutoff = ts - timedelta(hours=2)
+            cutoff = ts - timedelta(hours=window_hours)
             while window and window[0][0] < cutoff:
                 window.pop(0)
-            if len(window) >= adaptive_threshold:
+
+            if len(window) >= threshold_2h:
                 events.append({
                     "_id": f"re_{t['TransactionID']}_VEL",
                     "event_id": f"re_{t['TransactionID']}_VEL",
@@ -374,140 +512,62 @@ def derive_risk_events(txn_rows, txn_types):
                     "loan_id": t.get("LoanID"),
                     "event_type": "TXN_VELOCITY_SPIKE",
                     "severity": "MEDIUM",
-                    "score_impact": None,
-                    "observed_at": ts.isoformat(),
+                    # round to 3dp to avoid DECIMAL precision issues downstream
+                    "score_impact": round(score_medium, 3),
+                    "observed_at": ts.replace(tzinfo=timezone.utc).isoformat(),
                     "features": {
-                        "txn_count_last_2h": len(window),
-                        "baseline_txn_per_hour_median": float(baseline_per_hour),
-                        "adaptive_threshold_last_2h": int(adaptive_threshold),
-                        "raw_velocity_ratio": float(len(window) / adaptive_threshold if adaptive_threshold else 0.0),
+                        "window_hours": window_hours,
+                        "txn_count_last_window": len(window),
+                        "threshold_window": threshold_2h,
+                        "baseline_per_hour": round(baseline_per_hour, 6),
                         "amount": float(t["Amount"]) if t.get("Amount") is not None else None,
-                        "transaction_type": txn_types.get(t["TransactionTypeID"])
+                        "transaction_type": txn_types.get(t.get("TransactionTypeID")),
                     },
-                    "rule": {
-                        "rule_id": "R_TXN_002_ADAPT",
-                        "description": "Transaction velocity spike vs per-customer baseline (2h window)"
-                    },
-                    "as_of": as_of_iso,
-                    "source": {"derived_from": "dbo.transactions", "pipeline_version": PIPELINE_VERSION}
+                    "as_of_utc": as_of_iso,
                 })
-# High value: per-customer 95th percentile (fallback to global P95 if a customer has too few transactions)
-        cust_amounts = [float(t0["Amount"]) for t0 in txns if t0.get("Amount") is not None]
-        cust_amounts_sorted = sorted(cust_amounts)
+
+        # --------------------------
+        # High value txn: per-customer P95 (fallback global)
+        # --------------------------
+        cust_amounts = [float(x["Amount"]) for x in txns if x.get("Amount") is not None]
         cust_p95 = None
-        cust_p95_scope = None
+        if len(cust_amounts) >= min_txns_for_customer_p95:
+            s = sorted(cust_amounts)
+            idx = int(round(0.95 * (len(s) - 1)))
+            cust_p95 = s[idx]
+        else:
+            cust_p95 = global_p95
 
-        MIN_TXNS_FOR_CUST_P95 = 20  # keep this small; synthetic data can be sparse per customer
-        if len(cust_amounts_sorted) >= MIN_TXNS_FOR_CUST_P95:
-            idx_c = int(round(0.95 * (len(cust_amounts_sorted) - 1)))
-            cust_p95 = cust_amounts_sorted[idx_c]
-            cust_p95_scope = "customer"
-        elif p95 is not None:
-            cust_p95 = p95
-            cust_p95_scope = "global_fallback"
-
-        if cust_p95 is not None:
+        if cust_p95 is not None and cust_p95 > 0:
             for t in txns:
-                amt = float(t["Amount"]) if t.get("Amount") is not None else None
-                if amt is not None and amt >= cust_p95:
+                amt = t.get("Amount")
+                if amt is None:
+                    continue
+                amt_f = float(amt)
+                if amt_f >= cust_p95:
                     ts = t["TransactionDate"]
                     events.append({
-                        "_id": f"re_{t['TransactionID']}_HV",
-                        "event_id": f"re_{t['TransactionID']}_HV",
+                        "_id": f"re_{t['TransactionID']}_HIV",
+                        "event_id": f"re_{t['TransactionID']}_HIV",
                         "customer_id": cust_id,
                         "account_id": t.get("AccountOriginID"),
                         "transaction_id": t["TransactionID"],
                         "loan_id": t.get("LoanID"),
                         "event_type": "HIGH_VALUE_TXN",
                         "severity": "HIGH",
-                        "score_impact": 0.12,
-                        "observed_at": ts.isoformat(),
+                        "score_impact": round(score_high, 3),
+                        "observed_at": ts.replace(tzinfo=timezone.utc).isoformat(),
                         "features": {
-                            "amount": amt,
-                            "threshold_p95": float(cust_p95),
-                            "threshold_scope": cust_p95_scope,
-                            "raw_amount_ratio": float(amt / cust_p95) if cust_p95 else None,
-                            "customer_txn_amount_n": int(len(cust_amounts_sorted)),
-                            "transaction_type": txn_types.get(t["TransactionTypeID"])
+                            "amount": amt_f,
+                            "threshold_p95": cust_p95,
+                            "threshold_source": "customer_p95" if len(cust_amounts) >= min_txns_for_customer_p95 else "global_p95",
+                            "transaction_type": txn_types.get(t.get("TransactionTypeID")),
                         },
-                        "rule": {"rule_id": "R_TXN_001_ADAPT", "description": "Transaction amount above 95th percentile (per-customer, with fallback)"},
-                        "as_of": as_of_iso,
-                        "source": {"derived_from": "dbo.transactions", "pipeline_version": PIPELINE_VERSION}
+                        "as_of_utc": as_of_iso,
                     })
 
-    # ------------------------------------------------------------
-    # Data-calibrated scoring (unsupervised)
-    # ------------------------------------------------------------
-    # We do not have ground-truth labels (fraud/default) in this prototype.
-    # Instead of hard-coding fixed impacts (e.g., 0.08/0.12), we calibrate
-    # impacts using the empirical distribution of "how extreme" each event is.
-    #
-    # - TXN_VELOCITY_SPIKE: raw = txn_count_last_2h / adaptive_threshold_last_2h  (>=1 means threshold crossed)
-    # - HIGH_VALUE_TXN:     raw = amount / threshold_p95  (>=1 means threshold crossed)
-    #
-    # We map raw extremeness to a bounded score_impact via an empirical CDF per event_type.
-    # More extreme events get higher impact, preserving rank ordering for analytics.
-    def _ecdf_score(sorted_vals, x):
-        if not sorted_vals:
-            return 0.0
-        # proportion of values <= x
-        return bisect.bisect_right(sorted_vals, x) / float(len(sorted_vals))
+    return events
 
-    # collect raw values per event_type
-    raw_by_type = defaultdict(list)
-    for e in events:
-        et = e.get("event_type")
-        feats = e.get("features", {}) or {}
-        raw = None
-        if et == "TXN_VELOCITY_SPIKE":
-            raw = feats.get("raw_velocity_ratio")
-        elif et == "HIGH_VALUE_TXN":
-            raw = feats.get("raw_amount_ratio")
-        if raw is not None:
-            raw_by_type[et].append(float(raw))
-
-    sorted_raw = {k: sorted(v) for k, v in raw_by_type.items()}
-
-    # Map to bounded ranges by severity band (tunable but now *data-calibrated* within band)
-    # MEDIUM: 0.04–0.10   HIGH: 0.08–0.20
-    BAND = {
-        "MEDIUM": (0.04, 0.10),
-        "HIGH": (0.08, 0.20),
-    }
-
-    for e in events:
-        et = e.get("event_type")
-        sev = e.get("severity")
-        lo, hi = BAND.get(sev, (0.05, 0.15))
-        feats = e.get("features", {}) or {}
-        if et == "TXN_VELOCITY_SPIKE":
-            raw = feats.get("raw_velocity_ratio")
-        elif et == "HIGH_VALUE_TXN":
-            raw = feats.get("raw_amount_ratio")
-        else:
-            raw = None
-
-        if raw is None or et not in sorted_raw:
-            # fallback to mid-band if we cannot compute raw
-            e["score_impact"] = round((lo + hi) / 2.0, 6)
-            continue
-
-        q = _ecdf_score(sorted_raw[et], float(raw))  # 0..1
-        e["score_impact"] = round(lo + (hi - lo) * q, 6)
-
-
-
-    filtered = []
-    for e in events:
-        if (e["severity"] in SEVERITIES_TO_KEEP) or (e.get("score_impact", 0) >= RISK_SCORE_IMPACT_THRESHOLD):
-            filtered.append(e)
-
-    return filtered
-
-
-# -----------------------------
-# Load to Mongo
-# -----------------------------
 def upsert_customer_profiles(db, docs):
     ops = [
         UpdateOne({"customer_id": d["customer_id"]}, {"$set": d}, upsert=True)

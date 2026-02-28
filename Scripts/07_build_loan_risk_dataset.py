@@ -10,6 +10,7 @@
 import os
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import math
 
 import numpy as np
 import pandas as pd
@@ -380,14 +381,51 @@ def build_loan_risk_view(df_loans: pd.DataFrame, df_events: pd.DataFrame) -> pd.
 # ============================================================
 # Write to SQL (with safe placeholder generation)
 # ============================================================
+def get_sql_column_specs(conn: pyodbc.Connection, schema: str, table: str) -> dict:
+    """Return {column_name: {data_type, numeric_precision, numeric_scale}} from INFORMATION_SCHEMA."""
+    q = """
+    SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+    """
+    cur = conn.cursor()
+    rows = cur.execute(q, (schema, table)).fetchall()
+    specs = {}
+    for r in rows:
+        specs[str(r.COLUMN_NAME)] = {
+            "data_type": str(r.DATA_TYPE).lower(),
+            "precision": int(r.NUMERIC_PRECISION) if r.NUMERIC_PRECISION is not None else None,
+            "scale": int(r.NUMERIC_SCALE) if r.NUMERIC_SCALE is not None else None,
+        }
+    return specs
+
+
+def to_decimal_quantized(value, scale: int | None):
+    """Convert value to Decimal and quantize to given scale (e.g., scale=2 -> 0.01).
+    Returns None if value is NaN/inf/None.
+    """
+    if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+        return None
+    if pd.isna(value):
+        return None
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if scale is None:
+        return d
+    q = Decimal("1").scaleb(-scale)  # 10**(-scale)
+    return d.quantize(q, rounding=ROUND_HALF_UP)
+
+
 def write_loan_risk_view(conn: pyodbc.Connection, df_final: pd.DataFrame) -> None:
+    """Truncate + insert analytics.loan_risk_view with schema-aware DECIMAL handling.
+    Fixes 'Converting decimal loses precision' by quantizing to the actual column scale.
+    Also prints a helpful diagnostic if a specific row still fails.
     """
-    Truncates analytics.loan_risk_view and bulk inserts df_final.
-    Fixes:
-      - placeholder count always matches column list
-      - DECIMAL columns get Decimal/None, no NaN/inf
-    """
-    # Column order EXACTLY matches insert list
+    schema, table = "analytics", "loan_risk_view"
+    specs = get_sql_column_specs(conn, schema, table)
+
     cols = [
         "loan_id", "customer_id",
         "disbursement_account_id", "repayment_account_id",
@@ -400,64 +438,69 @@ def write_loan_risk_view(conn: pyodbc.Connection, df_final: pd.DataFrame) -> Non
     ]
 
     cur = conn.cursor()
-    cur.execute("TRUNCATE TABLE analytics.loan_risk_view;")
+    cur.execute(f"TRUNCATE TABLE {schema}.{table};")
     conn.commit()
 
     placeholders = ", ".join(["?"] * len(cols))
-    insert_sql = f"""
-    INSERT INTO analytics.loan_risk_view ({", ".join(cols)})
+    insert_sql = f"""\
+    INSERT INTO {schema}.{table} ({", ".join(cols)})
     VALUES ({placeholders});
     """
 
-    # Build rows with SQL-friendly types
+    def convert(col: str, v):
+        dt = specs.get(col, {}).get("data_type", "")
+        scale = specs.get(col, {}).get("scale")
+        # DECIMAL/NUMERIC: always send Decimal quantized to scale
+        if dt in {"decimal", "numeric"}:
+            return to_decimal_quantized(v, scale)
+        # INT-ish
+        if dt in {"int", "bigint", "smallint", "tinyint"}:
+            return int(v) if pd.notna(v) else None
+        # DATETIME-ish
+        if dt in {"datetime", "datetime2", "smalldatetime", "date", "time"}:
+            return safe_sql_datetime(v)
+        # strings
+        if dt in {"nvarchar", "varchar", "nchar", "char", "text", "ntext"}:
+            return None if pd.isna(v) else str(v)
+        # fallback: best effort
+        if pd.isna(v):
+            return None
+        return v
+
     rows = []
     for _, r in df_final.iterrows():
-        row = [
-            int(r["loan_id"]) if pd.notna(r["loan_id"]) else None,
-            int(r["customer_id"]) if pd.notna(r["customer_id"]) else None,
+        row = tuple(convert(c, r.get(c)) for c in cols)
+        rows.append(row)
 
-            int(r["disbursement_account_id"]) if pd.notna(r["disbursement_account_id"]) else None,
-            int(r["repayment_account_id"]) if pd.notna(r["repayment_account_id"]) else None,
+    # sanity check
+    if rows and insert_sql.count("?") != len(rows[0]):
+        raise ValueError(f"Placeholder mismatch: insert has {insert_sql.count('?')} params, row has {len(rows[0])} values.")
 
-            int(r["loan_status_id"]) if pd.notna(r["loan_status_id"]) else None,
-            None if pd.isna(r["loan_status_name"]) else str(r["loan_status_name"]),
-
-            # principal_amount / interest_rate - keep as float/Decimal-safe
-            None if pd.isna(r["principal_amount"]) else float(r["principal_amount"]),
-            None if pd.isna(r["interest_rate"]) else float(r["interest_rate"]),
-
-            safe_sql_datetime(r["start_date"]),
-            safe_sql_datetime(r["estimated_end_date"]),
-            
-            int(r["risk_events_30d"]),
-            int(r["high_severity_events_30d"]),
-            int(r["medium_severity_events_30d"]),
-            int(r["distinct_event_types_30d"]),
-
-            # DECIMAL safe value (Decimal or None)
-            r["max_score_impact_30d"],
-
-            safe_sql_datetime(r["last_risk_event_ts_30d"]),
-            int(r["high_risk_flag_30d"]),
-
-            int(r["risk_events_all"]),
-            safe_sql_datetime(r["last_risk_event_ts_all"]),
-
-            safe_sql_datetime(r["as_of_utc"]),
-        ]
-        rows.append(tuple(row))
-
-    # sanity checks (prevents your earlier issues)
-    if rows:
-        ph = insert_sql.count("?")
-        rl = len(rows[0])
-        if ph != rl:
-            raise ValueError(f"Placeholder mismatch: insert has {ph} params, row has {rl} values.")
-
-    # Bulk insert
+    # Bulk insert with diagnostics
     cur.fast_executemany = True
-    cur.executemany(insert_sql, rows)
-    conn.commit()
+    try:
+        cur.executemany(insert_sql, rows)
+        conn.commit()
+    except pyodbc.ProgrammingError as e:
+        # fallback: find first bad row and print it
+        conn.rollback()
+        cur.fast_executemany = False
+        for i, row in enumerate(rows):
+            try:
+                cur.execute(insert_sql, row)
+            except pyodbc.Error as e2:
+                # Try to extract loan_id for easier debugging
+                loan_id = row[0]
+                print("\n❌ Insert failed for a specific row (showing key fields):")
+                print({"row_index": i, "loan_id": loan_id})
+                # show all decimal columns in this row
+                dec_cols = [c for c in cols if specs.get(c, {}).get("data_type") in {"decimal", "numeric"}]
+                dec_preview = {c: row[cols.index(c)] for c in dec_cols}
+                print("Decimal fields:", dec_preview)
+                print("Original error:", e2)
+                raise
+        # if none found, re-raise original
+        raise
 
 
 # ============================================================
